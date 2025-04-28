@@ -1,75 +1,114 @@
-
+# Imports
 import pandas as pd
-from sklearn.model_selection import cross_val_predict, StratifiedKFold
-from sklearn.metrics import classification_report
-from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
-from transformers import DataCollatorWithPadding
+import numpy as np
 import torch
+from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
 from datasets import Dataset
+from sklearn.metrics import classification_report
 
-# Load preprocessed data
-from bruno_dataprep import X, y
+# 1. Detect device (MPS -> CUDA -> CPU fallback)
+device = torch.device("mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu"))
+print(f"Using device: {device}")
 
-# Encode labels
+# 2. Load preprocessed data
+X = pd.read_csv("X_daily.csv")
+y = pd.read_csv("y_daily.csv")
+X['target'] = y['target']
+
+# 3. Encode labels
 label2id = {'DOWN': 0, 'UP': 1}
 id2label = {0: 'DOWN', 1: 'UP'}
-labels = y.map(label2id)
+X['label'] = X['target'].map(label2id)
 
-# Tokenizer and dataset conversion
+# 4. Initialize tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 def tokenize_function(examples):
-    return tokenizer(examples['text'], truncation=True)
+    return tokenizer(examples['headlines'], truncation=True, padding='max_length', max_length=128)
 
-dataset = Dataset.from_dict({'text': X.tolist(), 'label': labels.tolist()})
-tokenized_dataset = dataset.map(tokenize_function, batched=True)
+# 5. Train-test split by unique dates
+unique_dates = X['date_used'].unique()
+np.random.seed(42)
+np.random.shuffle(unique_dates)
 
-# Data collator handles dynamic padding
-data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+split_idx = int(0.8 * len(unique_dates))
+train_dates = unique_dates[:split_idx]
+test_dates = unique_dates[split_idx:]
 
-# Model initialization
+train_df = X[X['date_used'].isin(train_dates)].reset_index(drop=True)
+test_df = X[X['date_used'].isin(test_dates)].reset_index(drop=True)
+
+print(f"Train samples: {len(train_df)}, Unique train dates: {len(train_df['date_used'].unique())}")
+print(f"Test samples: {len(test_df)}, Unique test dates: {len(test_df['date_used'].unique())}")
+
+# 6. Prepare datasets
+train_ds = Dataset.from_pandas(train_df[['headlines', 'label']])
+test_ds = Dataset.from_pandas(test_df[['headlines', 'label']])
+
+tokenized_train = train_ds.map(tokenize_function, batched=True)
+tokenized_test = test_ds.map(tokenize_function, batched=True)
+
+tokenized_train.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
+tokenized_test.set_format('torch', columns=['input_ids', 'attention_mask', 'label'])
+
+# 7. Load model
 model = BertForSequenceClassification.from_pretrained(
     'bert-base-uncased',
     num_labels=2,
     id2label=id2label,
     label2id=label2id
+).to(device)
+
+# 8. Set up training arguments
+training_args = TrainingArguments(
+    output_dir='./results-date-split',
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=64,
+    num_train_epochs=0.01,
+    logging_steps=10,
+    save_strategy='no',
+    learning_rate=2e-5,
+    seed=42,
+    disable_tqdm=True,
+    report_to="none"
 )
 
-# Cross-validation setup
-kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-predictions = []
-true_labels = []
+# 9. Set up Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_test,
+    tokenizer=tokenizer
+)
 
-for train_idx, test_idx in kfold.split(X, labels):
-    train_split = tokenized_dataset.select(train_idx)
-    test_split = tokenized_dataset.select(test_idx)
+# Train
+trainer.train()
 
-    training_args = TrainingArguments(
-        output_dir='./results',
-        num_train_epochs=2,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
-        evaluation_strategy="no",
-        save_strategy="no",
-        logging_steps=50,
-        disable_tqdm=True
-    )
+# Move model to CPU
+model_cpu = trainer.model.to('cpu')
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_split,
-        eval_dataset=test_split,
-        tokenizer=tokenizer,
-        data_collator=data_collator
-    )
+# Manually predict without Trainer.predict
+from torch.utils.data import DataLoader
 
-    trainer.train()
-    preds = trainer.predict(test_split)
-    preds_labels = preds.predictions.argmax(axis=1)
+eval_dataloader = DataLoader(tokenized_test, batch_size=64)
 
-    predictions.extend(preds_labels)
-    true_labels.extend(test_split['label'])
+model_cpu.eval()
+all_preds = []
+all_labels = []
 
-# Report metrics
-print(classification_report(true_labels, predictions, target_names=['DOWN', 'UP']))
+with torch.no_grad():
+    for batch in eval_dataloader:
+        # Only select the needed inputs
+        inputs = {k: v for k, v in batch.items() if k in ['input_ids', 'attention_mask']}
+        
+        outputs = model_cpu(**inputs)
+        logits = outputs.logits
+        preds = logits.argmax(dim=-1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(batch['label'].cpu().numpy())
+
+# Evaluate
+from sklearn.metrics import classification_report
+print(classification_report(all_labels, all_preds, target_names=['DOWN', 'UP']))
